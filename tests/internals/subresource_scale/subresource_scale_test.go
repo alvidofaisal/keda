@@ -23,10 +23,13 @@ const (
 
 var (
 	testNamespace           = fmt.Sprintf("%s-ns", testName)
-	argoNamespace           = "argo-rollouts"
-	monitoredDeploymentName = fmt.Sprintf("%s-monitored", testName)
-	argoRolloutName         = fmt.Sprintf("%s-rollout", testName)
-	scaledObjectName        = fmt.Sprintf("%s-so", testName)
+	argoNamespace             = "argo-rollouts"
+	monitoredDeploymentName   = fmt.Sprintf("%s-monitored", testName)
+	argoRolloutName           = fmt.Sprintf("%s-rollout", testName)
+	scaledObjectName          = fmt.Sprintf("%s-so", testName)
+	clusterCRDName            = "clusterscalers.testing.keda.sh"
+	clusterCRName             = fmt.Sprintf("%s-cr", testName)
+	clusterScaledObjectName = fmt.Sprintf("%s-cluster-so", testName)
 )
 
 type templateData struct {
@@ -34,6 +37,8 @@ type templateData struct {
 	MonitoredDeploymentName string
 	ArgoRolloutName         string
 	ScaledObjectName        string
+	ClusterCRName           string
+	ClusterScaledObjectName string
 }
 
 const (
@@ -110,6 +115,74 @@ spec:
       podSelector: 'app={{.MonitoredDeploymentName}}'
       value: '1'
 `
+
+	clusterScalerCRDTemplate = `
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: {{.ClusterCRDName}}
+spec:
+  group: testing.keda.sh
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  format: int32
+            status:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  format: int32
+      subresources:
+        scale:
+          specReplicasPath: .spec.replicas
+          statusReplicasPath: .status.replicas
+  scope: Cluster
+  names:
+    plural: clusterscalers
+    singular: clusterscaler
+    kind: ClusterScaler
+`
+	clusterScalerCRTemplate = `
+apiVersion: testing.keda.sh/v1alpha1
+kind: ClusterScaler
+metadata:
+  name: {{.ClusterCRName}}
+spec:
+  replicas: 0
+`
+
+	clusterScaledObjectTemplate = `
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{.ClusterScaledObjectName}}
+  namespace: {{.TestNamespace}}
+spec:
+  scaleTargetRef:
+    apiVersion: testing.keda.sh/v1alpha1
+    kind: ClusterScaler
+    name: {{.ClusterCRName}}
+  pollingInterval: 1
+  cooldownPeriod: 1
+  minReplicaCount: 0
+  maxReplicaCount: 2
+  triggers:
+  - type: cpu
+    metricType: Utilization
+    metadata:
+      value: "10"
+`
 )
 
 func TestScaler(t *testing.T) {
@@ -132,6 +205,9 @@ func TestScaler(t *testing.T) {
 	// test scaling
 	testScaleOut(t, kc)
 	testScaleIn(t, kc)
+
+	// Test cluster-scoped CRD scaling
+	testClusterScopedCRDScale(t, kc)
 }
 
 func setupArgo(t *testing.T, kc *kubernetes.Clientset) {
@@ -185,11 +261,28 @@ func getTemplateData() (templateData, []Template) {
 			TestNamespace:           testNamespace,
 			MonitoredDeploymentName: monitoredDeploymentName,
 			ArgoRolloutName:         argoRolloutName,
+			TestNamespace:           testNamespace,
+			MonitoredDeploymentName: monitoredDeploymentName,
+			ArgoRolloutName:         argoRolloutName,
 			ScaledObjectName:        scaledObjectName,
+			ClusterCRName:           clusterCRName,
+			ClusterScaledObjectName: clusterScaledObjectName,
 		}, []Template{
 			{Name: "monitoredDeploymentTemplate", Config: monitoredDeploymentTemplate},
 			{Name: "argoRolloutTemplate", Config: argoRolloutTemplate},
 			{Name: "scaledObjectTemplate", Config: scaledObjectTemplate},
+		}
+}
+
+func getClusterTemplateData() (templateData, []Template) {
+	return templateData{
+			TestNamespace:           testNamespace,
+			ClusterCRName:           clusterCRName,
+			ClusterScaledObjectName: clusterScaledObjectName,
+		}, []Template{
+			{Name: "clusterScalerCRDTemplate", Config: clusterScalerCRDTemplate, AdditionalData: map[string]string{"ClusterCRDName": clusterCRDName}},
+			{Name: "clusterScalerCRTemplate", Config: clusterScalerCRTemplate},
+			{Name: "clusterScaledObjectTemplate", Config: clusterScaledObjectTemplate},
 		}
 }
 
@@ -204,7 +297,7 @@ func waitForArgoRolloutReplicaCount(t *testing.T, name, namespace string, target
 		replicas, err := strconv.ParseInt(unqoutedOutput, 10, 64)
 		assert.NoErrorf(t, err, "cannot convert rollout count to int - %s", err)
 
-		t.Logf("Waiting for rollout replicas to hit target. Deployment - %s, Current  - %d, Target - %d",
+		t.Logf("Waiting for rollout replicas to hit target. Name - %s, Current  - %d, Target - %d",
 			name, replicas, target)
 
 		if replicas == int64(target) {
@@ -215,4 +308,131 @@ func waitForArgoRolloutReplicaCount(t *testing.T, name, namespace string, target
 	}
 
 	return false
+}
+
+func testClusterScopedCRDScale(t *testing.T, kc *kubernetes.Clientset) {
+	t.Log("--- testing cluster-scoped CRD scale ---")
+	data, templates := getClusterTemplateData()
+
+	// Create CRD
+	KubectlApplyWithTemplate(t, data, "clusterScalerCRDTemplate", templates)
+	t.Cleanup(func() {
+		KubectlDeleteWithTemplate(t, data, "clusterScalerCRDTemplate", templates)
+	})
+
+	// Create CR and ScaledObject
+	CreateKubernetesResources(t, kc, testNamespace, data, templates[1:]) // Skip CRD template
+	t.Cleanup(func() {
+		DeleteKubernetesResources(t, testNamespace, data, templates[1:])
+	})
+
+	assert.True(t, waitForClusterCRReplicaCount(t, clusterCRName, 0, 60),
+		"replica count should be 0 after 1 minute")
+
+	// Create a stress deployment to trigger CPU scaling
+	stressReplicas := 2
+	stressData := struct{ TestNamespace, Name string }{TestNamespace: testNamespace, Name: "stress"}
+	KubectlApplyWithTemplate(t, stressData, stressDeploymentTemplate, GetStressTemplates(testNamespace, stressReplicas))
+	t.Cleanup(func() {
+		KubectlDeleteWithTemplate(t, stressData, stressDeploymentTemplate, GetStressTemplates(testNamespace, stressReplicas))
+	})
+
+	// Check if CR scaled out
+	t.Log("--- checking scale out for cluster CRD ---")
+	assert.True(t, waitForClusterCRReplicaCount(t, clusterCRName, 2, 180), // Increased timeout for scaling
+		"replica count should be 2 after 3 minutes")
+
+	// Check KEDA operator logs for errors
+	kedaOperatorLogs, err := GetPodLogs(t, kc, KedaNamespace, "keda-operator", "")
+	require.NoErrorf(t, err, "cannot get keda operator logs - %s", err)
+	assert.NotContains(t, kedaOperatorLogs, "meta.k8s.io", "KEDA operator logs should not contain errors related to incorrect API group querying")
+
+	// Remove stress deployment
+	KubectlDeleteWithTemplate(t, stressData, stressDeploymentTemplate, GetStressTemplates(testNamespace, stressReplicas))
+
+	// Check if CR scaled in
+	t.Log("--- checking scale in for cluster CRD ---")
+	assert.True(t, waitForClusterCRReplicaCount(t, clusterCRName, 0, 180), // Increased timeout for scaling
+		"replica count should be 0 after 3 minutes")
+}
+
+func waitForClusterCRReplicaCount(t *testing.T, name string, targetReplicas, timeout int) bool {
+	for i := 0; i < timeout; i++ {
+		// Note: No namespace for cluster-scoped CRs
+		kctlGetCmd := fmt.Sprintf(`kubectl get clusterscaler %s -o jsonpath="{.spec.replicas}"`, name)
+		output, err := ExecuteCommand(kctlGetCmd)
+		if err != nil {
+			// It might take a moment for the CR to be available after creation or deletion
+			t.Logf("Error getting ClusterScaler %s: %v. Retrying...", name, err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		unquotedOutput := strings.ReplaceAll(string(output), "\"", "")
+		if unquotedOutput == "" { // Handle case where replicas might not be set initially
+			t.Logf("ClusterScaler %s replicas not yet set. Retrying...", name)
+			time.Sleep(time.Second)
+			continue
+		}
+		replicas, err := strconv.ParseInt(unquotedOutput, 10, 64)
+		if err != nil {
+			t.Logf("Error converting replica count for %s: %v. Output: '%s'. Retrying...", name, err, output)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		t.Logf("Waiting for ClusterScaler replicas. Name - %s, Current - %d, Target - %d",
+			name, replicas, targetReplicas)
+
+		if replicas == int64(targetReplicas) {
+			return true
+		}
+		time.Sleep(time.Second)
+	}
+	return false
+}
+
+const stressDeploymentTemplate = `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{.Name}}
+  namespace: {{.TestNamespace}}
+  labels:
+    app: {{.Name}}
+spec:
+  replicas: {{.Replicas}}
+  selector:
+    matchLabels:
+      app: {{.Name}}
+  template:
+    metadata:
+      labels:
+        app: {{.Name}}
+    spec:
+      containers:
+      - name: stress
+        image: polinux/stress
+        args:
+        - --cpu
+        - "1"
+        resources:
+          requests:
+            cpu: "0.5"
+          limits:
+            cpu: "1"
+`
+
+func GetStressTemplates(namespace string, replicas int) []Template {
+	return []Template{
+		{
+			Name:   "stressDeploymentTemplate",
+			Config: stressDeploymentTemplate,
+			AdditionalData: map[string]string{
+				"TestNamespace": namespace,
+				"Name":          "stress",
+				"Replicas":      fmt.Sprintf("%d", replicas),
+			},
+		},
+	}
 }

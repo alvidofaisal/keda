@@ -20,6 +20,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/scale"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	kedautil "github.com/kedacore/keda/v2/pkg/util"
@@ -28,7 +29,7 @@ import (
 var log = ctrl.Log.WithName("scaleclient")
 
 // InitScaleClient initializes scale client and returns k8s version
-func InitScaleClient(mgr ctrl.Manager) (scale.ScalesGetter, kedautil.K8sVersion, error) {
+func InitScaleClient(mgr ctrl.Manager, scaleTargetAPIVersion string, scaleTargetKind string) (scale.ScalesGetter, kedautil.K8sVersion, error) {
 	kubeVersion := kedautil.K8sVersion{}
 
 	// create Discovery clientset
@@ -51,6 +52,6 @@ func InitScaleClient(mgr ctrl.Manager) (scale.ScalesGetter, kedautil.K8sVersion,
 	return scale.New(
 		clientset.RESTClient(), mgr.GetRESTMapper(),
 		dynamic.LegacyAPIPathResolverFunc,
-		scale.NewDiscoveryScaleKindResolver(clientset),
+		scale.NewFixedScaleKindResolver(schema.FromAPIVersionAndKind(scaleTargetAPIVersion, scaleTargetKind), nil),
 	), kubeVersion, nil
 }
